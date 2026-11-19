@@ -20,12 +20,16 @@ from __future__ import annotations
 
 import argparse
 import http.server
+import io
 import json
+from pathlib import Path
 import socketserver
 import sys
 import unittest
 import urllib.parse
 from typing import Any, Dict
+
+import pandas as pd
 
 from inventory_agent import InventoryDecisionAgent
 
@@ -130,7 +134,7 @@ def render_streamlit_app():
         )
 
         st.markdown("---")
-        if st.button("🧪 Run Automated Unit Tests (22 Tests)"):
+        if st.button("🧪 Run Automated Unit Tests (25 Tests)"):
             import tests.test_inventory_tools as test_mod
             suite = unittest.defaultTestLoader.loadTestsFromModule(test_mod)
             res = unittest.TextTestRunner(verbosity=0).run(suite)
@@ -138,6 +142,11 @@ def render_streamlit_app():
                 st.success(f"✅ All {res.testsRun} unit tests passed successfully!")
             else:
                 st.error(f"❌ {len(res.failures)} failures, {len(res.errors)} errors.")
+
+        # Data Upload Section (Last section in the sidebar)
+        st.markdown("---")
+        st.header("Data Upload")
+        uploaded_file = st.file_uploader("Upload CSV File", type=["csv"])
 
     # Main Area: Input Form
     user_query = st.text_area(
@@ -151,11 +160,10 @@ def render_streamlit_app():
     with col1:
         solve_btn = st.button("🚀 Solve Question", type="primary", use_container_width=True)
 
-    if solve_btn or user_query.strip():
-        if not user_query.strip():
-            st.warning("Please enter an inventory question above or select a pre-loaded case study.")
-            return
+    if solve_btn and not user_query.strip():
+        st.warning("Please enter an inventory question above or select a pre-loaded case study.")
 
+    if user_query.strip():
         explicit_model = None
         if model_override == "Economic Order Quantity (EOQ)":
             explicit_model = agent.MODEL_EOQ
@@ -271,6 +279,111 @@ def render_streamlit_app():
         with tab_json:
             st.subheader("Complete Structured Decision Payload")
             st.json(decision.to_dict())
+
+    # ========================================================================
+    # CSV DATA UPLOAD & ANALYSIS SECTION
+    # ========================================================================
+    # ========================================================================
+    # CSV DATA UPLOAD & ANALYSIS SECTION
+    # ========================================================================
+    if uploaded_file is not None:
+        st.markdown("---")
+        st.header("📊 Uploaded CSV Data & Inventory Analysis")
+
+        try:
+            # 1. Read CSV into a pandas dataframe
+            df = pd.read_csv(uploaded_file)
+
+            # 2. Validate required columns
+            required_columns = ["Product", "Category", "Units", "Unit Cost"]
+            missing_columns = [col for col in required_columns if col not in df.columns]
+
+            # 3. If required columns missing, display clear message identifying them
+            if missing_columns:
+                st.error(
+                    f"❌ **Missing Required Columns:** The uploaded CSV is missing: "
+                    f"**{', '.join(missing_columns)}**.\n\n"
+                    f"The file must contain all required columns: **{', '.join(required_columns)}**."
+                )
+            else:
+                # Convert Units and Unit Cost to numeric using pandas
+                if df["Units"].dtype == object:
+                    df["Units"] = pd.to_numeric(df["Units"].astype(str).str.replace(",", "").str.strip(), errors="coerce")
+                else:
+                    df["Units"] = pd.to_numeric(df["Units"], errors="coerce")
+
+                if df["Unit Cost"].dtype == object:
+                    df["Unit Cost"] = pd.to_numeric(df["Unit Cost"].astype(str).str.replace("$", "").str.replace(",", "").str.strip(), errors="coerce")
+                else:
+                    df["Unit Cost"] = pd.to_numeric(df["Unit Cost"], errors="coerce")
+
+                # DATA ANALYSIS USING PANDAS
+                # 1. Total Units
+                total_units = df["Units"].sum()
+
+                # 2. Average Unit Cost
+                avg_unit_cost = df["Unit Cost"].mean()
+
+                # 3. Product with highest Units
+                max_units_idx = df["Units"].idxmax()
+                product_highest_units = df.loc[max_units_idx, "Product"]
+                max_units_val = df.loc[max_units_idx, "Units"]
+
+                # 4. Group data by Category and calculate total Units for each Category
+                units_by_category = df.groupby("Category", as_index=False)["Units"].sum().sort_values(by="Units", ascending=False)
+
+                # 5. Create new calculated column: Inventory Value = Units * Unit Cost
+                df["Inventory Value"] = df["Units"] * df["Unit Cost"]
+
+                # 6. Calculate total Inventory Value across all products
+                total_inventory_value = df["Inventory Value"].sum()
+
+                # RESULTS DISPLAY
+                # 4. Display the uploaded dataframe in the main Streamlit page
+                # 5. Display number of rows, number of columns, column names
+                st.subheader("📋 Dataset Overview")
+                dcol1, dcol2, dcol3 = st.columns([1, 1, 2])
+                dcol1.metric("Number of Rows", f"{len(df):,}")
+                dcol2.metric("Number of Columns", f"{len(df.columns):,}")
+                dcol3.markdown(f"**Column Names:** `{', '.join(list(df.columns))}`")
+
+                # Summary KPIs
+                st.subheader("📈 Summary Metrics")
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("Total Units", f"{total_units:,.0f}")
+                k2.metric("Average Unit Cost", f"${avg_unit_cost:,.2f}")
+                k3.metric("Product with Highest Units", f"{product_highest_units}", f"{max_units_val:,.0f} units")
+                k4.metric("Total Inventory Value", f"${total_inventory_value:,.2f}")
+
+                # Total Units by Category
+                st.subheader("📂 Total Units by Category")
+                st.dataframe(
+                    units_by_category,
+                    use_container_width=True,
+                    column_config={
+                        "Category": st.column_config.TextColumn("Category"),
+                        "Units": st.column_config.NumberColumn("Total Units", format="%d"),
+                    },
+                    hide_index=True,
+                )
+
+                # Display the dataframe including the new Inventory Value column
+                st.subheader("📄 Uploaded Dataframe (with Calculated Inventory Value)")
+                st.dataframe(
+                    df,
+                    use_container_width=True,
+                    column_config={
+                        "Product": st.column_config.TextColumn("Product"),
+                        "Category": st.column_config.TextColumn("Category"),
+                        "Units": st.column_config.NumberColumn("Units", format="%d"),
+                        "Unit Cost": st.column_config.NumberColumn("Unit Cost", format="$%.2f"),
+                        "Inventory Value": st.column_config.NumberColumn("Inventory Value", format="$%.2f"),
+                    },
+                    hide_index=True,
+                )
+
+        except Exception as e:
+            st.error(f"❌ Error reading or processing CSV file: {str(e)}")
 
 
 # ============================================================================
