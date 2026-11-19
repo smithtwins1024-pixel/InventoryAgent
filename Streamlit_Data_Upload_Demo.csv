@@ -1,0 +1,11 @@
+Product,Category,Units,Unit Cost
+P101,Office Supplies,120,8.5
+P102,Office Supplies,75,12.0
+P103,Electronics,40,45.0
+P104,Electronics,65,30.0
+P105,Office Supplies,150,6.5
+P106,Packaging,200,3.25
+P107,Packaging,175,4.0
+P108,Maintenance,55,18.5
+P109,Maintenance,90,14.0
+P110,Electronics,35,60.0
