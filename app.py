@@ -306,6 +306,31 @@ def render_streamlit_app():
                     f"The file must contain all required columns: **{', '.join(required_columns)}**."
                 )
             else:
+                # Capture dimensions of the uploaded dataframe (4 columns: Product, Category, Units, Unit Cost)
+                num_rows = len(df)
+                num_cols = len(df.columns)
+                col_names = list(df.columns)
+
+                # DATA PROCESSING (Step 4 & 5: Dataset Overview on uploaded data)
+                st.subheader("📋 Dataset Overview")
+                dcol1, dcol2, dcol3 = st.columns([1, 1, 2])
+                dcol1.metric("Number of Rows", f"{num_rows:,}")
+                dcol2.metric("Number of Columns", f"{num_cols:,}")
+                dcol3.markdown(f"**Column Names:** `{', '.join(col_names)}`")
+
+                # Step 4: Display the uploaded dataframe (4 columns)
+                st.dataframe(
+                    df[["Product", "Category", "Units", "Unit Cost"]],
+                    use_container_width=True,
+                    column_config={
+                        "Product": st.column_config.TextColumn("Product"),
+                        "Category": st.column_config.TextColumn("Category"),
+                        "Units": st.column_config.NumberColumn("Units", format="%d"),
+                        "Unit Cost": st.column_config.NumberColumn("Unit Cost", format="$%.2f"),
+                    },
+                    hide_index=True,
+                )
+
                 # Convert Units and Unit Cost to numeric using pandas
                 if df["Units"].dtype == object:
                     df["Units"] = pd.to_numeric(df["Units"].astype(str).str.replace(",", "").str.strip(), errors="coerce")
@@ -339,14 +364,6 @@ def render_streamlit_app():
                 total_inventory_value = df["Inventory Value"].sum()
 
                 # RESULTS DISPLAY
-                # 4. Display the uploaded dataframe in the main Streamlit page
-                # 5. Display number of rows, number of columns, column names
-                st.subheader("📋 Dataset Overview")
-                dcol1, dcol2, dcol3 = st.columns([1, 1, 2])
-                dcol1.metric("Number of Rows", f"{len(df):,}")
-                dcol2.metric("Number of Columns", f"{len(df.columns):,}")
-                dcol3.markdown(f"**Column Names:** `{', '.join(list(df.columns))}`")
-
                 # Summary KPIs
                 st.subheader("📈 Summary Metrics")
                 k1, k2, k3, k4 = st.columns(4)
