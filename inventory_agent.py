@@ -23,9 +23,24 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
+import sys
+import importlib
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+# Ensure the agent's directory is always first in sys.path
+_agent_dir = str(Path(__file__).parent.resolve())
+if _agent_dir not in sys.path:
+    sys.path.insert(0, _agent_dir)
+
 import inventory_tools as it
+if not hasattr(it, "classify_inventory_multicriteria"):
+    it = importlib.reload(it)
+
+try:
+    from inventory_tools import classify_inventory_multicriteria, ClassificationResult
+except Exception:
+    pass
 
 
 # ============================================================================
@@ -109,28 +124,107 @@ class InventoryInputExtractor:
     def extract_discount_schedule(cls, text: str) -> List[Tuple[int, Optional[int], float]]:
         """
         Parses tiered price breaks:
+          - "charges $12 per unit for orders below 500, $11.50 for 500-999, and $11 for 1,000 or more"
+          - "<500: $12, 500-999: $11.50, >=1000: $11"
           - "1-499: $10, 500-999: $9.50, 1000+: $9.00"
           - "1 to 499 units at $12, 500 to 999 at $11, 1000 and above at $10"
         """
+        text = cls.clean_text(text)
         tiers: List[Tuple[int, Optional[int], float]] = []
 
-        # Pattern 1: Bounded tier min - max at $price
-        bounded_pattern = r'(\d+)\s*(?:-|to)\s*(\d+)\s*(?:units?)?\s*(?:at|@|:|\$)?\s*\$?([0-9]+(?:\.[0-9]+)?)'
-        for m in re.finditer(bounded_pattern, text, re.IGNORECASE):
-            low = int(m.group(1))
-            high = int(m.group(2))
-            price = float(m.group(3))
-            tiers.append((low, high, price))
+        # 1. Price before 'below/under/less than/< Y'
+        # e.g., 'charges $12 per unit for orders below 500'
+        for m in re.finditer(
+            r'(?:charges?|costs?|price\s*is)?\s*\$?([0-9]+(?:\.[0-9]+)?)\s*(?:per\s*unit|each)?\s*(?:for\s+)?(?:orders?\s+)?(?:below|under|less\s+than|<)\s*([0-9]+)',
+            text,
+            re.IGNORECASE,
+        ):
+            p = float(m.group(1))
+            hi = int(m.group(2)) - 1
+            tiers.append((1, hi, p))
 
-        # Pattern 2: Open-ended tier min+ or min and above at $price
-        open_pattern = r'(\d+)\s*(?:\+|and above|or more|and over|\s*plus)\s*(?:units?)?\s*(?:at|@|:|\$)?\s*\$?([0-9]+(?:\.[0-9]+)?)'
-        for m in re.finditer(open_pattern, text, re.IGNORECASE):
-            low = int(m.group(1))
-            price = float(m.group(2))
-            tiers.append((low, None, price))
+        # 2. 'below/under/less than/< Y at/cost/: $price'
+        # e.g., '<500: $12' or 'orders below 500: $12' or 'below 500 at $12'
+        for m in re.finditer(
+            r'(?:orders?\s+)?(?:below|under|less\s+than|<)\s*([0-9]+)\s*(?:units?)?\s*(?:at|@|:|\$|\s+for|\s+costs?|\s+charges?)\s*(?:cost\s+)?\$?([0-9]+(?:\.[0-9]+)?)',
+            text,
+            re.IGNORECASE,
+        ):
+            hi = int(m.group(1)) - 1
+            p = float(m.group(2))
+            if not any(t[1] == hi and t[2] == p for t in tiers):
+                tiers.append((1, hi, p))
 
-        tiers.sort(key=lambda t: t[0])
-        return tiers
+        # 3. Price before 'min-max'
+        # e.g., '$11.50 for 500-999' or '$11.50 for orders of 500 to 999'
+        for m in re.finditer(
+            r'\$?([0-9]+(?:\.[0-9]+)?)\s*(?:per\s*unit|each)?\s*for\s*(?:orders?\s+(?:of\s+)?)?([0-9]+)\s*(?:-|to)\s*([0-9]+)',
+            text,
+            re.IGNORECASE,
+        ):
+            p = float(m.group(1))
+            lo = int(m.group(2))
+            hi = int(m.group(3))
+            if not any(t[0] == lo and t[1] == hi for t in tiers):
+                tiers.append((lo, hi, p))
+
+        # 4. 'min-max at/:/$ $price'
+        # e.g., '500-999: $11.50' or '500 to 999 units at $11'
+        for m in re.finditer(
+            r'([0-9]+)\s*(?:-|to)\s*([0-9]+)\s*(?:units?)?\s*(?:at|@|:|\$)\s*\$?([0-9]+(?:\.[0-9]+)?)',
+            text,
+            re.IGNORECASE,
+        ):
+            lo = int(m.group(1))
+            hi = int(m.group(2))
+            p = float(m.group(3))
+            if not any(t[0] == lo and t[1] == hi for t in tiers):
+                tiers.append((lo, hi, p))
+
+        # 5. Price before 'min or more'
+        # e.g., '$11 for 1000 or more' or '$11 for orders of 1000 or more'
+        for m in re.finditer(
+            r'\$?([0-9]+(?:\.[0-9]+)?)\s*(?:per\s*unit|each)?\s*for\s*(?:orders?\s+(?:of\s+)?)?([0-9]+)\s*(?:or\s+more|and\s+above|and\s+over|\+|or\s+over)',
+            text,
+            re.IGNORECASE,
+        ):
+            p = float(m.group(1))
+            lo = int(m.group(2))
+            if not any(t[0] == lo and t[1] is None for t in tiers):
+                tiers.append((lo, None, p))
+
+        # 6. 'min or more at $price' or '1000+: $11' or '>= 1000: $11'
+        for m in re.finditer(
+            r'(?:>=|>)\s*([0-9]+)\s*(?:units?)?\s*(?:at|@|:|\$)\s*\$?([0-9]+(?:\.[0-9]+)?)',
+            text,
+            re.IGNORECASE,
+        ):
+            lo = int(m.group(1))
+            p = float(m.group(2))
+            if not any(t[0] == lo and t[1] is None for t in tiers):
+                tiers.append((lo, None, p))
+
+        for m in re.finditer(
+            r'([0-9]+)\s*(?:\+|and above|or more|and over|\s*plus)\s*(?:units?)?\s*(?:at|@|:|\$)\s*\$?([0-9]+(?:\.[0-9]+)?)',
+            text,
+            re.IGNORECASE,
+        ):
+            lo = int(m.group(1))
+            p = float(m.group(2))
+            if not any(t[0] == lo and t[1] is None for t in tiers):
+                tiers.append((lo, None, p))
+
+        # Deduplicate and sort
+        unique_tiers = []
+        seen = set()
+        for t in tiers:
+            key = (t[0], t[1])
+            if key not in seen:
+                seen.add(key)
+                unique_tiers.append(t)
+
+        unique_tiers.sort(key=lambda t: t[0])
+        return unique_tiers
 
     # ------------------------------------------------------------------------
     # 1. EOQ INPUT EXTRACTION
@@ -147,18 +241,53 @@ class InventoryInputExtractor:
           - cost of placing an order
           - ordering/setup cost
           - ordering / setup cost
+        Automatically detects and converts time units (e.g. monthly demand to annual, weeks to days).
         """
         inputs: Dict[str, Any] = {}
 
-        # 1. Demand D
-        demand = cls.extract_first_match([
-            r'(?:annual demand|yearly demand|annual sales|demand per year|demand of|demand is|demand:)\s*([0-9]+(?:\.[0-9]+)?)',
-            r'(?:we sell|sells?|selling)\s+([0-9]+(?:\.[0-9]+)?)\s*(?:units)?\s*(?:per year|annually|a year)?',
-            r'([0-9]+(?:\.[0-9]+)?)\s*(?:units per year|units/year|units annually|annual demand)',
+        # 1. Demand D (Detect unit: monthly, weekly, daily, annual)
+        monthly_demand = cls.extract_first_match([
+            r'(?:monthly\s+demand|demand\s+per\s+month|monthly\s+sales|demand\s+each\s+month)(?:\s*(?:is|of|:|=))?\s*([0-9]+(?:\.[0-9]+)?)',
+            r'([0-9]+(?:\.[0-9]+)?)\s*(?:units|items|pieces)?\s*(?:per\s+month|/\s*month|monthly|a\s+month|each\s+month|per\s+mo|/\s*mo)',
+            r'demands?\s*(?:is|of|:|=)?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:units|items|pieces)?\s*(?:per\s+month|/\s*month|monthly|a\s+month|each\s+month|per\s+mo|/\s*mo)',
+        ], text)
+        weekly_demand = cls.extract_first_match([
+            r'(?:weekly\s+demand|demand\s+per\s+week|weekly\s+sales|demand\s+each\s+week)(?:\s*(?:is|of|:|=))?\s*([0-9]+(?:\.[0-9]+)?)',
+            r'([0-9]+(?:\.[0-9]+)?)\s*(?:units|items|pieces)?\s*(?:per\s+week|/\s*week|weekly|a\s+week|each\s+week|per\s+wk|/\s*wk)',
+            r'demands?\s*(?:is|of|:|=)?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:units|items|pieces)?\s*(?:per\s+week|/\s*week|weekly|a\s+week|each\s+week|per\s+wk|/\s*wk)',
+        ], text)
+        daily_demand = cls.extract_first_match([
+            r'(?:daily\s+demand|demand\s+per\s+day|daily\s+sales|demand\s+each\s+day)(?:\s*(?:is|of|:|=))?\s*([0-9]+(?:\.[0-9]+)?)',
+            r'([0-9]+(?:\.[0-9]+)?)\s*(?:units|items|pieces)?\s*(?:per\s+day|/\s*day|daily|a\s+day|each\s+day)',
+            r'demands?\s*(?:is|of|:|=)?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:units|items|pieces)?\s*(?:per\s+day|/\s*day|daily|a\s+day|each\s+day)',
+        ], text)
+        annual_demand = cls.extract_first_match([
+            r'(?:annual\s+demand|yearly\s+demand|annual\s+sales|demand\s+per\s+year)(?:\s*(?:is|of|:|=))?\s*([0-9]+(?:\.[0-9]+)?)',
+            r'([0-9]+(?:\.[0-9]+)?)\s*(?:units|items|pieces)?\s*(?:per\s+year|/\s*year|annually|yearly|a\s+year|per\s+yr|/\s*yr)',
+            r'demands?\s*(?:is|of|:|=)?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:units|items|pieces)?\s*(?:per\s+year|/\s*year|annually|yearly|a\s+year)',
+            r'(?:we\s+sell|sells?|selling)\s+([0-9]+(?:\.[0-9]+)?)\s*(?:units)?\s*(?:per\s+year|annually|a\s+year)?',
             r'demands?\s*(?:is|=|:)?\s*([0-9]+(?:\.[0-9]+)?)',
         ], text)
-        if demand is not None:
-            inputs["demand"] = demand
+
+        if monthly_demand is not None:
+            inputs["original_demand"] = monthly_demand
+            inputs["demand_unit"] = "month"
+            inputs["demand"] = monthly_demand * 12.0
+            inputs["annual_demand_D"] = monthly_demand * 12.0
+        elif weekly_demand is not None:
+            inputs["original_demand"] = weekly_demand
+            inputs["demand_unit"] = "week"
+            inputs["demand"] = weekly_demand * 52.0
+            inputs["annual_demand_D"] = weekly_demand * 52.0
+        elif daily_demand is not None:
+            inputs["original_demand"] = daily_demand
+            inputs["demand_unit"] = "day"
+            inputs["demand"] = daily_demand * 250.0
+            inputs["annual_demand_D"] = daily_demand * 250.0
+        elif annual_demand is not None:
+            inputs["demand"] = annual_demand
+            inputs["demand_unit"] = "year"
+            inputs["annual_demand_D"] = annual_demand
 
         # 2. Ordering / Setup Cost S (comprehensive synonyms)
         order_cost = cls.extract_first_match([
@@ -175,22 +304,44 @@ class InventoryInputExtractor:
         if order_cost is not None:
             inputs["order_cost"] = order_cost
 
-        # 3. Holding Cost H (Fixed amount)
-        holding_cost = cls.extract_first_match([
-            r'(?:fixed holding cost|holding cost per unit|carrying cost per unit)(?:\s*(?:is|of|:|=))?\s*\$?([0-9]+(?:\.[0-9]+)?)(?!\s*%)',
-            r'(?:inventory holding cost|holding cost|carrying cost|storage cost)(?:\s*(?:is|of|:|=))?\s*\$?([0-9]+(?:\.[0-9]+)?)(?!\s*%)',
-            r'\$?([0-9]+(?:\.[0-9]+)?)\s*(?:per unit per year|per unit/year|per unit annually|holding cost|carrying cost)',
-        ], text)
-        if holding_cost is not None:
-            inputs["holding_cost"] = holding_cost
-
-        # 4. Holding Rate i (Percentage)
+        # 3. Holding Rate i (Percentage) - extract first so 20% is not misparsed as $2.00
         holding_rate = cls.extract_percentage([
-            r'(?:percentage holding cost|holding cost rate|carrying cost rate|holding rate|carrying rate|holding percentage|carrying percentage)(?:\s*(?:is|of|:|=))?\s*([0-9]+(?:\.[0-9]+)?)\s*%',
-            r'([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:holding|carrying|of unit cost|annual holding rate|per year holding|holding cost|carrying cost)',
+            r'(?:percentage\s+holding\s+cost|holding\s+cost\s+rate|annual\s+holding\s+cost\s+rate|annual\s+holding\s+rate|carrying\s+cost\s+rate|holding\s+rate|carrying\s+rate|holding\s+percentage|carrying\s+percentage|annual\s+holding\s+cost|holding\s+cost|carrying\s+cost)(?:\s*(?:is|of|:|=))?\s*([0-9]+(?:\.[0-9]+)?)\s*%',
+            r'([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:holding|carrying|annual\s+holding\s+rate|of\s+purchase\s+price|of\s+unit\s+cost|of\s+unit\s+price|of\s+cost|of\s+price|holding\s+cost|carrying\s+cost)',
+            r'([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:annual\s+holding|carrying\s+rate)',
         ], text)
         if holding_rate is not None:
             inputs["holding_rate"] = holding_rate
+
+        # 4. Holding Cost H (Fixed amount - only if holding_rate is not provided)
+        if "holding_rate" not in inputs:
+            monthly_h = cls.extract_first_match([
+                r'(?:monthly holding cost|holding cost per month|carrying cost per month)(?:\s*(?:is|of|:|=))?\s*\$?([0-9]+(?:\.[0-9]+)?)(?!\s*%)',
+                r'\$?([0-9]+(?:\.[0-9]+)?)\s*(?:per unit per month|per unit/month|per month|/month)\s*(?:holding|carrying)?',
+                r'(?:holding cost|carrying cost)(?:\s*(?:is|of|:|=))?\s*\$?([0-9]+(?:\.[0-9]+)?)\s*(?:per unit per month|per unit/month|per month|/month)',
+            ], text)
+            weekly_h = cls.extract_first_match([
+                r'(?:weekly holding cost|holding cost per week|carrying cost per week)(?:\s*(?:is|of|:|=))?\s*\$?([0-9]+(?:\.[0-9]+)?)(?!\s*%)',
+                r'\$?([0-9]+(?:\.[0-9]+)?)\s*(?:per unit per week|per unit/week|per week|/week)\s*(?:holding|carrying)?',
+            ], text)
+            annual_h = cls.extract_first_match([
+                r'(?:annual holding cost|holding cost per year|carrying cost per year)(?:\s*(?:is|of|:|=))?\s*\$?([0-9]+(?:\.[0-9]+)?)(?!\s*%)',
+                r'(?:fixed holding cost|holding cost per unit|carrying cost per unit)(?:\s*(?:is|of|:|=))?\s*\$?([0-9]+(?:\.[0-9]+)?)(?!\s*%)',
+                r'(?:inventory holding cost|holding cost|carrying cost|storage cost)(?:\s*(?:is|of|:|=))?\s*\$?([0-9]+(?:\.[0-9]+)?)(?!\s*%)',
+                r'\$?([0-9]+(?:\.[0-9]+)?)\s*(?:per unit per year|per unit/year|per unit annually|holding cost|carrying cost)',
+            ], text)
+
+            if monthly_h is not None:
+                inputs["original_holding_cost"] = monthly_h
+                inputs["holding_cost_unit"] = "month"
+                inputs["holding_cost"] = monthly_h * 12.0
+            elif weekly_h is not None:
+                inputs["original_holding_cost"] = weekly_h
+                inputs["holding_cost_unit"] = "week"
+                inputs["holding_cost"] = weekly_h * 52.0
+            elif annual_h is not None:
+                inputs["holding_cost"] = annual_h
+                inputs["holding_cost_unit"] = "year"
 
         # 5. Unit purchase cost C
         unit_cost = cls.extract_first_match([
@@ -201,13 +352,23 @@ class InventoryInputExtractor:
         if unit_cost is not None:
             inputs["unit_cost"] = unit_cost
 
-        # 6. Lead time (days)
-        lead_time = cls.extract_first_match([
-            r'(?:lead time|delivery time|supplier takes)(?:\s*(?:is|of|:|=))?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:days?|weeks?)',
+        # 6. Lead time (Convert weeks to days if in weeks)
+        lt_wks = cls.extract_first_match([
+            r'(?:lead time|delivery time|supplier takes)(?:\s*(?:is|of|:|=))?\s*([0-9]+(?:\.[0-9]+)?)\s*weeks?',
+            r'([0-9]+(?:\.[0-9]+)?)\s*weeks?\s*(?:lead time|delivery time)',
+        ], text)
+        lt_days = cls.extract_first_match([
+            r'(?:lead time|delivery time|supplier takes)(?:\s*(?:is|of|:|=))?\s*([0-9]+(?:\.[0-9]+)?)\s*days?',
             r'([0-9]+(?:\.[0-9]+)?)\s*days?\s*(?:lead time|delivery time)',
         ], text)
-        if lead_time is not None:
-            inputs["lead_time_days"] = lead_time
+
+        if lt_wks is not None:
+            inputs["lead_time_days"] = lt_wks * 7.0
+            inputs["lead_time_unit"] = "week"
+            inputs["original_lead_time"] = lt_wks
+        elif lt_days is not None:
+            inputs["lead_time_days"] = lt_days
+            inputs["lead_time_unit"] = "day"
 
         return inputs
 
@@ -223,61 +384,119 @@ class InventoryInputExtractor:
           - average lead time (L)
           - lead-time standard deviation (sigma_L)
           - service level (CSL)
+        Parses lead time (L) and lead-time standard deviation (sigma_L) expressed
+        in weeks, months, or days, and converts them to match daily demand (1 week = 7 days, 1 month = 30 days).
         """
         inputs: Dict[str, Any] = {}
 
-        # 1. Lead-time standard deviation (Extract first so demand std doesn't consume it!)
-        lead_time_std = cls.extract_first_match([
-            r'(?:lead-time standard deviation|lead time standard deviation|lead time std dev|lead time std|std dev of lead time|sigma l|sigma_l)(?:\s*(?:is|of|:|=))?\s*([0-9]+(?:\.[0-9]+)?)',
-            r'lead time(?:\s+averages|\s+is)?\s+[0-9]+(?:\.[0-9]+)?(?:\s+days)?\s+with\s+(?:a\s+)?standard deviation\s+(?:of\s+)?([0-9]+(?:\.[0-9]+)?)',
-            r'([0-9]+(?:\.[0-9]+)?)\s*(?:days?)?\s*(?:lead time standard deviation|lead time std)',
-        ], text)
-        if lead_time_std is not None:
-            inputs["sigma_L"] = lead_time_std
-            inputs["lead_time_days_std"] = lead_time_std
+        # 1. Lead time (L) and Lead-time standard deviation (sigma_L) combined or separate
+        lt_val: Optional[float] = None
+        lt_unit = "day"
+        lt_std_val: Optional[float] = None
+        lt_std_unit: Optional[str] = None
 
-        # 2. Demand standard deviation
+        # Check combined pattern first: e.g. "Average lead time is 3 weeks with a standard deviation of 0.5 weeks"
+        comb_match = re.search(
+            r'(?:average\s+lead\s+time|mean\s+lead\s+time|supplier\s+lead\s+time|lead\s+time)'
+            r'(?:\s*(?:is|averages|of|:|=))?\s*([0-9]+(?:\.[0-9]+)?)\s*(weeks?|months?|days?|wks?|mo|d)?'
+            r'.*?(?:standard\s+deviation|std\s*dev|sigma|sigma_l|sigma\s*l)'
+            r'(?:\s*(?:is|of|:|=))?\s*([0-9]+(?:\.[0-9]+)?)\s*(weeks?|months?|days?|wks?|mo|d)?',
+            text,
+            re.IGNORECASE,
+        )
+        if comb_match:
+            lt_val = float(comb_match.group(1))
+            lt_unit = comb_match.group(2) or "day"
+            lt_std_val = float(comb_match.group(3))
+            lt_std_unit = comb_match.group(4) or lt_unit
+        else:
+            # Standalone lead-time standard deviation
+            std_match = re.search(
+                r'(?:lead\s*-?\s*time\s+(?:standard\s+deviation|std\s*dev|std|sigma)|standard\s+deviation\s+of\s+lead\s*-?\s*time|sigma_l|sigma\s+l)'
+                r'(?:\s*(?:is|of|:|=))?\s*([0-9]+(?:\.[0-9]+)?)\s*(weeks?|months?|days?|wks?|mo|d)?',
+                text,
+                re.IGNORECASE,
+            )
+            if std_match:
+                lt_std_val = float(std_match.group(1))
+                lt_std_unit = std_match.group(2)
+
+            # Standalone lead time
+            lt_match = re.search(
+                r'(?:average\s+lead\s+time|mean\s+lead\s+time|supplier\s+lead\s+time|lead\s+time)'
+                r'(?:\s*(?:is|averages|of|:|=))?\s*([0-9]+(?:\.[0-9]+)?)\s*(weeks?|months?|days?|wks?|mo|d)?',
+                text,
+                re.IGNORECASE,
+            )
+            if lt_match:
+                lt_val = float(lt_match.group(1))
+                if lt_match.group(2):
+                    lt_unit = lt_match.group(2)
+
+        # Normalize lead time units and convert to days (1 week = 7 days, 1 month = 30 days)
+        if lt_val is not None:
+            u_clean = lt_unit.lower()
+            inputs["original_lead_time"] = lt_val
+            if u_clean in ["week", "weeks", "wk", "wks", "weekly"]:
+                inputs["lead_time_unit"] = "week"
+                l_days = lt_val * 7.0
+            elif u_clean in ["month", "months", "mo", "monthly"]:
+                inputs["lead_time_unit"] = "month"
+                l_days = lt_val * 30.0
+            else:
+                inputs["lead_time_unit"] = "day"
+                l_days = lt_val
+
+            inputs["lead_time"] = l_days
+            inputs["lead_time_mean"] = l_days
+            inputs["lead_time_days_mean"] = l_days
+            inputs["lead_time_days"] = l_days
+
+        if lt_std_val is not None:
+            su_clean = (lt_std_unit or lt_unit).lower()
+            inputs["original_sigma_L"] = lt_std_val
+            if su_clean in ["week", "weeks", "wk", "wks", "weekly"]:
+                s_l_days = lt_std_val * 7.0
+            elif su_clean in ["month", "months", "mo", "monthly"]:
+                s_l_days = lt_std_val * 30.0
+            else:
+                s_l_days = lt_std_val
+
+            inputs["sigma_L"] = s_l_days
+            inputs["lead_time_days_std"] = s_l_days
+
+        # 2. Demand standard deviation (sigma_d)
         demand_std = cls.extract_first_match([
-            r'(?:demand standard deviation|standard deviation of demand|demand std dev|demand std|daily demand std|sigma d|sigma_d)(?:\s*(?:is|of|:|=))?\s*([0-9]+(?:\.[0-9]+)?)',
-            r'demand(?:\s+averages|\s+is)?\s+[0-9]+(?:\.[0-9]+)?(?:\s+units)?\s+with\s+(?:a\s+)?standard deviation\s+(?:of\s+)?([0-9]+(?:\.[0-9]+)?)',
-            r'with\s+(?:a\s+)?standard deviation\s+(?:of\s+)?([0-9]+(?:\.[0-9]+)?)(?!\s*days?)',
-            r'(?:standard deviation|std dev|sigma)(?:\s*(?:is|of|:|=))?\s*([0-9]+(?:\.[0-9]+)?)(?!\s*days?)',
+            r'(?:demand\s+standard\s+deviation|standard\s+deviation\s+of\s+demand|demand\s+std\s*dev|demand\s+std|daily\s+demand\s+std|sigma\s*d|sigma_d)(?:\s*(?:is|of|:|=))?\s*([0-9]+(?:\.[0-9]+)?)',
+            r'demand(?:\s+averages|\s+is)?\s+[0-9]+(?:\.[0-9]+)?(?:\s+units)?\s+with\s+(?:a\s+)?standard\s+deviation\s+(?:of\s+)?([0-9]+(?:\.[0-9]+)?)',
+            r'demand.*?(?:standard\s+deviation|std\s*dev|sigma)(?:\s*(?:is|of|:|=))?\s*([0-9]+(?:\.[0-9]+)?)',
+            r'with\s+(?:a\s+)?standard\s+deviation\s+(?:of\s+)?([0-9]+(?:\.[0-9]+)?)(?!\s*(?:days?|weeks?|months?))',
         ], text)
         if demand_std is not None:
             inputs["sigma_d"] = demand_std
             inputs["daily_demand_std"] = demand_std
 
-        # 3. Average lead time (L)
-        lead_time = cls.extract_first_match([
-            r'(?:average lead time|mean lead time|lead time averages|supplier lead time|lead time)(?:\s*(?:is|of|:|=))?\s*([0-9]+(?:\.[0-9]+)?)\s*days?',
-            r'([0-9]+(?:\.[0-9]+)?)\s*days?\s*(?:average lead time|supplier lead time|lead time)',
-        ], text)
-        if lead_time is not None:
-            inputs["lead_time"] = lead_time
-            inputs["lead_time_mean"] = lead_time
-            inputs["lead_time_days_mean"] = lead_time
-
-        # 4. Average demand (d)
+        # 3. Average daily demand (d)
         demand = cls.extract_first_match([
-            r'(?:average daily demand|mean daily demand|daily demand mean|daily demand averages|daily demand average|average demand|mean demand|demand mean|daily demand)(?:\s*(?:is|averages|of|:|=))?\s*([0-9]+(?:\.[0-9]+)?)',
-            r'([0-9]+(?:\.[0-9]+)?)\s*units?\s*(?:per day|daily|average daily demand)',
+            r'(?:average\s+daily\s+demand|mean\s+daily\s+demand|daily\s+demand\s+mean|daily\s+demand\s+averages|daily\s+demand\s+average|average\s+demand|mean\s+demand|demand\s+mean|daily\s+demand)(?:\s*(?:is|averages|of|:|=))?\s*([0-9]+(?:\.[0-9]+)?)',
+            r'([0-9]+(?:\.[0-9]+)?)\s*units?\s*(?:per\s+day|daily|average\s+daily\s+demand)',
             r'demand\s*(?:averages|is|=)\s*([0-9]+(?:\.[0-9]+)?)',
         ], text)
         if demand is not None:
             inputs["daily_demand"] = demand
             inputs["daily_demand_mean"] = demand
 
-        # 5. Service level (CSL)
+        # 4. Service level (CSL)
         csl = cls.extract_percentage([
-            r'(?:cycle service level|service level|target service level|csl|in-stock probability|in-stock rate)(?:[^0-9%]*?)\s*([0-9]+(?:\.[0-9]+)?)\s*%',
-            r'([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:cycle service level|service level|csl|in-stock)',
+            r'(?:cycle\s+service\s+level|service\s+level|target\s+service\s+level|csl|in-stock\s+probability|in-stock\s+rate)(?:[^0-9%]*?)\s*([0-9]+(?:\.[0-9]+)?)\s*%',
+            r'([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:cycle\s+service\s+level|service\s+level|csl|in-stock)',
         ], text)
         if csl is not None:
             inputs["service_level"] = csl
 
-        # 6. Order quantity Q (optional, for fill rate)
+        # 5. Order quantity Q (optional, for fill rate)
         q = cls.extract_first_match([
-            r'(?:order quantity|batch size|order size|q)(?:\s*(?:is|of|:|=))?\s*([0-9]+(?:\.[0-9]+)?)',
+            r'(?:order\s+quantity|batch\s+size|order\s+size|q)(?:\s*(?:is|of|:|=))?\s*([0-9]+(?:\.[0-9]+)?)',
         ], text)
         if q is not None:
             inputs["order_quantity"] = q
@@ -297,41 +516,77 @@ class InventoryInputExtractor:
           - fixed holding cost
           - percentage holding cost
           - unit purchase price
+        Automatically converts time units (e.g. monthly demand to annual).
         """
         inputs: Dict[str, Any] = {}
 
-        # 1. Demand D
-        demand = cls.extract_first_match([
-            r'(?:annual demand|yearly demand|demand of|demand is|demand:)\s*([0-9]+(?:\.[0-9]+)?)',
-            r'([0-9]+(?:\.[0-9]+)?)\s*(?:units per year|units/year|annual demand)',
-            r'demand\s*(?:is|=|:)?\s*([0-9]+(?:\.[0-9]+)?)',
+        # 1. Demand D (Check monthly/weekly/annual)
+        monthly_demand = cls.extract_first_match([
+            r'(?:monthly\s+demand|demand\s+per\s+month|demand\s+each\s+month)(?:\s*(?:is|of|:|=))?\s*([0-9]+(?:\.[0-9]+)?)',
+            r'([0-9]+(?:\.[0-9]+)?)\s*(?:units|items|pieces)?\s*(?:per\s+month|/\s*month|monthly|a\s+month|each\s+month|per\s+mo|/\s*mo)',
+            r'demands?\s*(?:is|of|:|=)?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:units|items|pieces)?\s*(?:per\s+month|/\s*month|monthly|a\s+month|each\s+month|per\s+mo|/\s*mo)',
         ], text)
-        if demand is not None:
-            inputs["demand"] = demand
+        weekly_demand = cls.extract_first_match([
+            r'(?:weekly\s+demand|demand\s+per\s+week|demand\s+each\s+week)(?:\s*(?:is|of|:|=))?\s*([0-9]+(?:\.[0-9]+)?)',
+            r'([0-9]+(?:\.[0-9]+)?)\s*(?:units|items|pieces)?\s*(?:per\s+week|/\s*week|weekly|a\s+week|each\s+week|per\s+wk|/\s*wk)',
+            r'demands?\s*(?:is|of|:|=)?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:units|items|pieces)?\s*(?:per\s+week|/\s*week|weekly|a\s+week|each\s+week|per\s+wk|/\s*wk)',
+        ], text)
+        annual_demand = cls.extract_first_match([
+            r'(?:annual\s+demand|yearly\s+demand|demand\s+per\s+year|demand\s+of|demand\s+is|demand:)\s*([0-9]+(?:\.[0-9]+)?)',
+            r'([0-9]+(?:\.[0-9]+)?)\s*(?:units|items|pieces)?\s*(?:per\s+year|/\s*year|annual\s+demand|annually|yearly|a\s+year)',
+            r'demands?\s*(?:is|=|:)?\s*([0-9]+(?:\.[0-9]+)?)',
+        ], text)
+
+        if monthly_demand is not None:
+            inputs["original_demand"] = monthly_demand
+            inputs["demand_unit"] = "month"
+            inputs["demand"] = monthly_demand * 12.0
+            inputs["annual_demand_D"] = monthly_demand * 12.0
+        elif weekly_demand is not None:
+            inputs["original_demand"] = weekly_demand
+            inputs["demand_unit"] = "week"
+            inputs["demand"] = weekly_demand * 52.0
+            inputs["annual_demand_D"] = weekly_demand * 52.0
+        elif annual_demand is not None:
+            inputs["demand"] = annual_demand
+            inputs["demand_unit"] = "year"
+            inputs["annual_demand_D"] = annual_demand
 
         # 2. Ordering cost S (using full synonym list)
         order_cost = cls.extract_first_match([
-            r'(?:ordering/setup cost|cost of placing an order|cost per order|setup cost|setup expense|ordering cost|order cost)(?:\s*(?:is|of|:|=))?\s*\$?([0-9]+(?:\.[0-9]+)?)',
-            r'\$?([0-9]+(?:\.[0-9]+)?)\s*(?:per order|order cost|setup cost)',
+            r'(?:ordering/setup\s+cost|ordering\s*/\s*setup\s+cost|ordering\s+and\s+setup\s+cost|cost\s+of\s+placing\s+an\s+order|cost\s+per\s+order|setup\s+cost|setup\s+expense|ordering\s+cost|order\s+cost)(?:\s*(?:is|of|:|=))?\s*\$?([0-9]+(?:\.[0-9]+)?)',
+            r'\$?([0-9]+(?:\.[0-9]+)?)\s*(?:per\s+order|order\s+cost|setup\s+cost|to\s+place\s+each\s+order|to\s+place\s+an\s+order)',
         ], text)
         if order_cost is not None:
             inputs["order_cost"] = order_cost
 
-        # 3. Percentage holding cost (i)
+        # 3. Percentage holding cost (i) - extract first so 20% is not misparsed as $2.00
         holding_rate = cls.extract_percentage([
-            r'(?:percentage holding cost|holding cost rate|carrying cost rate|holding rate|carrying rate|holding percentage|carrying percentage)(?:\s*(?:is|of|:|=))?\s*([0-9]+(?:\.[0-9]+)?)\s*%',
-            r'([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:holding|carrying|annual holding rate|of purchase price|holding cost|carrying cost)',
+            r'(?:percentage\s+holding\s+cost|holding\s+cost\s+rate|annual\s+holding\s+cost\s+rate|annual\s+holding\s+rate|carrying\s+cost\s+rate|holding\s+rate|carrying\s+rate|holding\s+percentage|carrying\s+percentage|annual\s+holding\s+cost|holding\s+cost|carrying\s+cost)(?:\s*(?:is|of|:|=))?\s*([0-9]+(?:\.[0-9]+)?)\s*%',
+            r'([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:holding|carrying|annual\s+holding\s+rate|of\s+purchase\s+price|of\s+unit\s+cost|of\s+unit\s+price|of\s+cost|of\s+price|holding\s+cost|carrying\s+cost)',
+            r'([0-9]+(?:\.[0-9]+)?)\s*%\s*(?:annual\s+holding|carrying\s+rate)',
         ], text)
         if holding_rate is not None:
             inputs["holding_rate"] = holding_rate
 
-        # 4. Fixed holding cost (H)
-        fixed_holding = cls.extract_first_match([
-            r'(?:fixed holding cost|fixed carrying cost)(?:\s*(?:is|of|:|=))?\s*\$?([0-9]+(?:\.[0-9]+)?)(?!\s*%)',
-            r'holding cost(?:\s*(?:is|of|:|=))?\s*\$?([0-9]+(?:\.[0-9]+)?)(?!\s*%)',
-        ], text)
-        if fixed_holding is not None and "holding_rate" not in inputs:
-            inputs["holding_cost"] = fixed_holding
+        # 4. Fixed holding cost (H) - only if holding_rate is not specified
+        if "holding_rate" not in inputs:
+            monthly_h = cls.extract_first_match([
+                r'(?:monthly\s+holding\s+cost|holding\s+cost\s+per\s+month)(?:\s*(?:is|of|:|=))?\s*\$?([0-9]+(?:\.[0-9]+)?)(?!\s*%)',
+                r'\$?([0-9]+(?:\.[0-9]+)?)\s*(?:per\s+unit\s+per\s+month|per\s+unit/month|per\s+month|/month)\s*(?:holding|carrying)?',
+            ], text)
+            annual_h = cls.extract_first_match([
+                r'(?:fixed\s+holding\s+cost|fixed\s+carrying\s+cost)(?:\s*(?:is|of|:|=))?\s*\$?([0-9]+(?:\.[0-9]+)?)(?!\s*%)',
+                r'holding\s+cost(?:\s*(?:is|of|:|=))?\s*\$?([0-9]+(?:\.[0-9]+)?)(?!\s*%)',
+            ], text)
+
+            if monthly_h is not None:
+                inputs["holding_cost"] = monthly_h * 12.0
+                inputs["holding_cost_unit"] = "month"
+                inputs["original_holding_cost"] = monthly_h
+            elif annual_h is not None:
+                inputs["holding_cost"] = annual_h
+                inputs["holding_cost_unit"] = "year"
 
         # 5. Discount Schedule / Quantity Breaks
         tiers = cls.extract_discount_schedule(text)
@@ -355,33 +610,62 @@ class InventoryInputExtractor:
           - on-hand inventory
           - on-order inventory
           - backorders
+        Automatically converts time units (weeks to days) for protection period (T + L) consistency.
         """
         inputs: Dict[str, Any] = {}
 
-        # 1. Review Period T
-        review_period = cls.extract_first_match([
+        # 1. Review Period T (Detect weeks vs days)
+        t_wks = cls.extract_first_match([
+            r'(?:review period|review interval|reviewed every|review every)(?:\s*(?:is|of|:|=))?\s*([0-9]+(?:\.[0-9]+)?)\s*weeks?',
+            r'every\s*([0-9]+(?:\.[0-9]+)?)\s*weeks?',
+        ], text)
+        t_days = cls.extract_first_match([
             r'(?:review period|review interval|reviewed every|review every)(?:\s*(?:is|of|:|=))?\s*([0-9]+(?:\.[0-9]+)?)\s*days?',
             r'every\s*([0-9]+(?:\.[0-9]+)?)\s*days?',
         ], text)
-        if review_period is None:
-            if "weekly" in text.lower():
-                review_period = 7.0
-            elif "biweekly" in text.lower() or "two weeks" in text.lower():
-                review_period = 14.0
-            elif "monthly" in text.lower():
-                review_period = 30.0
-        if review_period is not None:
-            inputs["review_period"] = review_period
-            inputs["review_period_days"] = review_period
 
-        # 2. Lead time L
-        lead_time = cls.extract_first_match([
+        if t_wks is not None:
+            inputs["review_period_unit"] = "week"
+            inputs["original_review_period"] = t_wks
+            inputs["review_period"] = t_wks * 7.0
+            inputs["review_period_days"] = t_wks * 7.0
+        elif t_days is not None:
+            inputs["review_period_unit"] = "day"
+            inputs["review_period"] = t_days
+            inputs["review_period_days"] = t_days
+        else:
+            if "biweekly" in text.lower() or "two weeks" in text.lower():
+                inputs["review_period"] = 14.0
+                inputs["review_period_days"] = 14.0
+                inputs["review_period_unit"] = "week"
+            elif "weekly" in text.lower() or "one week" in text.lower() or "every week" in text.lower():
+                inputs["review_period"] = 7.0
+                inputs["review_period_days"] = 7.0
+                inputs["review_period_unit"] = "week"
+            elif "monthly" in text.lower() or "every month" in text.lower():
+                inputs["review_period"] = 30.0
+                inputs["review_period_days"] = 30.0
+                inputs["review_period_unit"] = "month"
+
+        # 2. Lead time L (Detect weeks vs days)
+        l_wks = cls.extract_first_match([
+            r'(?:lead time|delivery time|supplier lead time)(?:\s*(?:is|of|:|=))?\s*([0-9]+(?:\.[0-9]+)?)\s*weeks?',
+            r'([0-9]+(?:\.[0-9]+)?)\s*weeks?\s*(?:lead time|delivery time)',
+        ], text)
+        l_days = cls.extract_first_match([
             r'(?:lead time|delivery time|supplier lead time)(?:\s*(?:is|of|:|=))?\s*([0-9]+(?:\.[0-9]+)?)\s*days?',
             r'([0-9]+(?:\.[0-9]+)?)\s*days?\s*(?:lead time|delivery time)',
         ], text)
-        if lead_time is not None:
-            inputs["lead_time"] = lead_time
-            inputs["lead_time_days"] = lead_time
+
+        if l_wks is not None:
+            inputs["lead_time_unit"] = "week"
+            inputs["original_lead_time"] = l_wks
+            inputs["lead_time"] = l_wks * 7.0
+            inputs["lead_time_days"] = l_wks * 7.0
+        elif l_days is not None:
+            inputs["lead_time_unit"] = "day"
+            inputs["lead_time"] = l_days
+            inputs["lead_time_days"] = l_days
 
         # 3. Average daily demand d
         demand_mean = cls.extract_first_match([
@@ -462,9 +746,9 @@ class InventoryInputExtractor:
         Distinguishes:
           - selling price (p)
           - purchase cost (c)
-          - salvage value (s)
-          - underage / shortage cost (Cu)
-          - overage / excess cost (Co)
+          - salvage value (v / s)
+          - underage / shortage cost (Cu = p - c)
+          - overage / excess cost (Co = c - v)
           - demand distribution: mean demand (mu), demand std (sigma)
         """
         inputs: Dict[str, Any] = {}
@@ -478,6 +762,7 @@ class InventoryInputExtractor:
         ], text)
         if selling_price is not None:
             inputs["selling_price"] = selling_price
+            inputs["p"] = selling_price
 
         # 2. Purchase cost c
         unit_cost = cls.extract_first_match([
@@ -487,14 +772,16 @@ class InventoryInputExtractor:
         ], text)
         if unit_cost is not None:
             inputs["unit_cost"] = unit_cost
+            inputs["c"] = unit_cost
 
-        # 3. Salvage value s
+        # 3. Salvage value v / s
         salvage_value = cls.extract_first_match([
-            r'(?:salvage value|salvage price|liquidated for|liquidate for|scrap value|markdown price|residual value)(?:\s*(?:is|of|:|=))?\s*\$?([0-9]+(?:\.[0-9]+)?)',
+            r'(?:salvage value|salvage price|liquidated for|liquidate for|scrap value|markdown price|residual value|salvage\s*v|v\s*=)(?:\s*(?:is|of|:|=))?\s*\$?([0-9]+(?:\.[0-9]+)?)',
             r'\$?([0-9]+(?:\.[0-9]+)?)\s*(?:salvage|salvage value|scrap value|salvage price)',
         ], text)
         if salvage_value is not None:
             inputs["salvage_value"] = salvage_value
+            inputs["v"] = salvage_value
 
         # 4. Underage / Shortage cost Cu (or goodwill penalty g)
         cu = cls.extract_first_match([
@@ -502,12 +789,14 @@ class InventoryInputExtractor:
         ], text)
         if cu is not None:
             inputs["underage_cost"] = cu
+            inputs["Cu"] = cu
 
         goodwill = cls.extract_first_match([
             r'(?:goodwill penalty|goodwill loss|loss of goodwill|shortage penalty|penalty cost)(?:\s*(?:is|of|:|=))?\s*\$?([0-9]+(?:\.[0-9]+)?)',
         ], text)
         if goodwill is not None:
             inputs["goodwill_penalty"] = goodwill
+            inputs["g"] = goodwill
 
         # 5. Overage / Excess cost Co
         co = cls.extract_first_match([
@@ -515,6 +804,7 @@ class InventoryInputExtractor:
         ], text)
         if co is not None:
             inputs["overage_cost"] = co
+            inputs["Co"] = co
 
         # If Cu and Co are directly provided, synthesize consistent p and c
         if "underage_cost" in inputs and "overage_cost" in inputs:
@@ -523,8 +813,11 @@ class InventoryInputExtractor:
                 # Cu = p - c = (Cu + Co) - Co = Cu
                 # Co = c - s = Co - 0 = Co
                 inputs["unit_cost"] = inputs["overage_cost"]
+                inputs["c"] = inputs["unit_cost"]
                 inputs["selling_price"] = inputs["underage_cost"] + inputs["unit_cost"]
+                inputs["p"] = inputs["selling_price"]
                 inputs["salvage_value"] = 0.0
+                inputs["v"] = 0.0
 
         # 6. Mean demand mu
         demand_mean = cls.extract_first_match([
@@ -534,6 +827,7 @@ class InventoryInputExtractor:
         ], text)
         if demand_mean is not None:
             inputs["demand_mean"] = demand_mean
+            inputs["mu"] = demand_mean
 
         # 7. Demand standard deviation sigma
         demand_std = cls.extract_first_match([
@@ -543,6 +837,7 @@ class InventoryInputExtractor:
         ], text)
         if demand_std is not None:
             inputs["demand_std"] = demand_std
+            inputs["sigma"] = demand_std
 
         return inputs
 
@@ -601,17 +896,30 @@ class InventoryDecisionAgent:
             scores[self.MODEL_NEWSVENDOR] += 6
 
         # 2. Quantity Discount indicators
-        if any(k in q_lower for k in ["quantity discount", "discount schedule", "price break", "price bracket", "all-units", "all units discount", "volume discount"]):
-            scores[self.MODEL_QUANTITY_DISCOUNT] += 15
+        if any(k in q_lower for k in [
+            "quantity discount", "discount schedule", "price break", "price bracket",
+            "all-units", "all units discount", "volume discount", "tiered", "price tier"
+        ]):
+            scores[self.MODEL_QUANTITY_DISCOUNT] += 25
         if "tier" in q_lower or ("discount" in q_lower and any(w in q_lower for w in ["price", "cost", "bracket", "schedule"])):
-            scores[self.MODEL_QUANTITY_DISCOUNT] += 8
+            scores[self.MODEL_QUANTITY_DISCOUNT] += 15
+        if any(w in q_lower for w in ["below", "under", "or more", "and above", "and over"]) and ("$" in q_lower or "charges" in q_lower or "price" in q_lower or "per unit" in q_lower):
+            scores[self.MODEL_QUANTITY_DISCOUNT] += 20
+        if "charges" in q_lower and ("$" in q_lower or "per unit" in q_lower):
+            scores[self.MODEL_QUANTITY_DISCOUNT] += 15
         if "-" in q_lower and ("$" in q_lower or "at" in q_lower) and any(w in q_lower for w in ["order", "bracket", "tier", "price"]):
-            scores[self.MODEL_QUANTITY_DISCOUNT] += 6
+            scores[self.MODEL_QUANTITY_DISCOUNT] += 15
+        try:
+            tiers_found = self.extractor.extract_discount_schedule(self.extractor.clean_text(question))
+            if len(tiers_found) >= 2:
+                scores[self.MODEL_QUANTITY_DISCOUNT] += 35
+        except Exception:
+            pass
 
         # 3. Fixed-Period Review indicators
-        if any(k in q_lower for k in ["fixed period", "fixed-period", "periodic review", "order-up-to", "order up to", "target level", "review interval", "(t, s)", "t,s"]):
+        if any(k in q_lower for k in ["fixed period", "fixed-period", "periodic review", "order-up-to", "order up to", "target level", "review interval", "(t, s)", "t,s", "inventory position"]):
             scores[self.MODEL_FIXED_PERIOD_REVIEW] += 15
-        if any(k in q_lower for k in ["review every", "reviewed every", "review period", "every 7 days", "every 14 days", "every week", "every month", "weekly review", "biweekly review"]):
+        if any(k in q_lower for k in ["review every", "reviewed every", "review period", "every 7 days", "every 14 days", "every week", "every 2 weeks", "every two weeks", "every month", "weekly review", "biweekly review", "review inventory"]):
             scores[self.MODEL_FIXED_PERIOD_REVIEW] += 9
         if "on hand" in q_lower and ("on order" in q_lower or "backorder" in q_lower):
             scores[self.MODEL_FIXED_PERIOD_REVIEW] += 7
@@ -633,6 +941,25 @@ class InventoryDecisionAgent:
             scores[self.MODEL_EOQ] += 3
 
         # Disambiguation heuristics
+        # Route any prompt containing price breaks, volume discounts, or tiered unit prices
+        # (such as "charges $X per unit for orders below Y, $Z for ..." or "or more") to the Quantity Discount model - NEVER basic EOQ!
+        has_multiple_tiers = False
+        try:
+            has_multiple_tiers = len(self.extractor.extract_discount_schedule(self.extractor.clean_text(question))) >= 2
+        except Exception:
+            pass
+
+        qd_terms = [
+            "charges", "price break", "volume discount", "tiered", "price tier", "quantity discount",
+            "discount schedule", "price bracket", "all-units", "all units",
+            "orders below", "orders under", "below 500", "under 500", "<500", "< 500",
+            "or more", "and above", "and over", ">=1000", ">= 1000",
+        ]
+        has_qd_terms = any(term in q_lower for term in qd_terms) and ("$" in q_lower or "%" in q_lower or "tier" in q_lower or "schedule" in q_lower)
+
+        if has_multiple_tiers or (has_qd_terms and scores[self.MODEL_QUANTITY_DISCOUNT] > 0):
+            return self.MODEL_QUANTITY_DISCOUNT
+
         if scores[self.MODEL_FIXED_PERIOD_REVIEW] >= 8:
             return self.MODEL_FIXED_PERIOD_REVIEW
 
@@ -736,51 +1063,67 @@ class InventoryDecisionAgent:
         Invokes the deterministic tools in `inventory_tools.py`.
         """
         if model == self.MODEL_EOQ:
+            demand_val = float(inputs.get("original_demand", inputs["demand"])) if inputs.get("demand_unit") and inputs.get("demand_unit") != "year" and "original_demand" in inputs else float(inputs["demand"])
+            holding_cost_val = float(inputs["original_holding_cost"]) if inputs.get("holding_cost_unit") and inputs.get("holding_cost_unit") != "year" and "original_holding_cost" in inputs else (float(inputs["holding_cost"]) if inputs.get("holding_cost") is not None else None)
+            lead_time_val = float(inputs["original_lead_time"]) if inputs.get("lead_time_unit") and inputs.get("lead_time_unit") != "day" and "original_lead_time" in inputs else float(inputs.get("lead_time_days", 0.0))
+
             res = it.calculate_eoq(
-                demand=float(inputs["demand"]),
+                demand=demand_val,
                 order_cost=float(inputs["order_cost"]),
-                holding_cost=float(inputs["holding_cost"]) if inputs.get("holding_cost") is not None else None,
+                holding_cost=holding_cost_val,
                 holding_rate=float(inputs["holding_rate"]) if inputs.get("holding_rate") is not None else None,
                 unit_cost=float(inputs.get("unit_cost", 0.0)),
                 work_days=int(inputs.get("work_days", 250)),
-                lead_time_days=float(inputs.get("lead_time_days", 0.0)),
+                lead_time_days=lead_time_val,
+                demand_unit=str(inputs.get("demand_unit", "year")),
+                holding_cost_unit=str(inputs.get("holding_cost_unit", "year")),
+                lead_time_unit=str(inputs.get("lead_time_unit", "day")),
+                days_per_week=float(inputs.get("days_per_week", 7.0)),
             )
             v_passed = res.verification.get("holding_equals_ordering_at_eoq", False)
             return res, v_passed, res.verification
 
         elif model == self.MODEL_QUANTITY_DISCOUNT:
+            demand_val = float(inputs.get("original_demand", inputs["demand"])) if inputs.get("demand_unit") and inputs.get("demand_unit") != "year" and "original_demand" in inputs else float(inputs["demand"])
+            holding_cost_val = float(inputs["original_holding_cost"]) if inputs.get("holding_cost_unit") and inputs.get("holding_cost_unit") != "year" and "original_holding_cost" in inputs else (float(inputs["holding_cost"]) if inputs.get("holding_cost") is not None else None)
+
             res = it.calculate_quantity_discount(
-                demand=float(inputs["demand"]),
+                demand=demand_val,
                 order_cost=float(inputs["order_cost"]),
                 holding_rate=float(inputs["holding_rate"]) if inputs.get("holding_rate") is not None else None,
-                holding_cost=float(inputs["holding_cost"]) if inputs.get("holding_cost") is not None else None,
+                holding_cost=holding_cost_val,
                 discount_schedule=inputs["discount_schedule"],
+                demand_unit=str(inputs.get("demand_unit", "year")),
+                holding_cost_unit=str(inputs.get("holding_cost_unit", "year")),
             )
             v_passed = res.verification.get("is_global_minimum", False)
             return res, v_passed, res.verification
 
         elif model == self.MODEL_SAFETY_STOCK_ROP:
-            d = float(inputs.get("daily_demand") or inputs.get("daily_demand_mean"))  # type: ignore
-            L = float(inputs.get("lead_time") or inputs.get("lead_time_days_mean"))  # type: ignore
+            d_val = float(inputs.get("original_daily_demand", inputs.get("daily_demand") or inputs.get("daily_demand_mean")))  # type: ignore
+            L_val = float(inputs.get("original_lead_time", inputs.get("lead_time") or inputs.get("lead_time_days_mean") or inputs.get("lead_time_days")))  # type: ignore
             s_d = float(inputs.get("sigma_d") or inputs.get("daily_demand_std") or 0.0)
-            s_L = float(inputs.get("sigma_L") or inputs.get("lead_time_days_std") or 0.0)
+            s_L = float(inputs.get("original_sigma_L", inputs.get("sigma_L") or inputs.get("lead_time_days_std") or 0.0))
             csl = float(inputs.get("service_level", 0.95))
             q = float(inputs["order_quantity"]) if inputs.get("order_quantity") else None
 
             res = it.calculate_rop(
-                daily_demand=d,
-                lead_time=L,
+                daily_demand=d_val,
+                lead_time=L_val,
                 sigma_d=s_d,
                 sigma_L=s_L,
                 service_level=csl,
                 order_quantity=q,
+                demand_time_unit=str(inputs.get("demand_time_unit", "day")),
+                lead_time_unit=str(inputs.get("lead_time_unit", "day")),
+                days_per_week=float(inputs.get("days_per_week", 7.0)),
             )
             v_passed = res.verification.get("rop_greater_than_or_equal_dltd", False) and res.verification.get("ss_non_negative", False)
             return res, v_passed, res.verification
 
         elif model == self.MODEL_FIXED_PERIOD_REVIEW:
-            T = float(inputs.get("review_period") or inputs.get("review_period_days"))  # type: ignore
-            L = float(inputs.get("lead_time") or inputs.get("lead_time_days"))  # type: ignore
+            T_val = float(inputs.get("original_review_period", inputs.get("review_period") or inputs.get("review_period_days")))  # type: ignore
+            L_val = float(inputs.get("original_lead_time", inputs.get("lead_time") or inputs.get("lead_time_days")))  # type: ignore
             d = float(inputs.get("demand_mean") or inputs.get("daily_demand_mean"))  # type: ignore
             s_d = float(inputs.get("demand_std") or inputs.get("daily_demand_std") or 0.0)
             csl = float(inputs.get("service_level", 0.95))
@@ -789,26 +1132,30 @@ class InventoryDecisionAgent:
             oo = float(inputs.get("on_order", 0.0))
 
             res = it.calculate_periodic_review(
-                review_period=T,
-                lead_time=L,
+                review_period=T_val,
+                lead_time=L_val,
                 demand_mean=d,
                 demand_std=s_d,
                 service_level=csl,
                 inventory_position=inv_pos,
                 on_hand=oh,
                 on_order=oo,
+                review_period_unit=str(inputs.get("review_period_unit", "day")),
+                lead_time_unit=str(inputs.get("lead_time_unit", "day")),
+                demand_time_unit=str(inputs.get("demand_time_unit", "day")),
+                days_per_week=float(inputs.get("days_per_week", 7.0)),
             )
             v_passed = res.verification.get("target_inventory_covers_expected_demand", False) and res.verification.get("order_quantity_non_negative", False)
             return res, v_passed, res.verification
 
         elif model == self.MODEL_NEWSVENDOR:
             res = it.calculate_newsvendor(
-                selling_price=float(inputs["selling_price"]),
-                unit_cost=float(inputs["unit_cost"]),
-                salvage_value=float(inputs.get("salvage_value", 0.0)),
-                goodwill_penalty=float(inputs.get("goodwill_penalty", 0.0)),
-                demand_mean=float(inputs["demand_mean"]),
-                demand_std=float(inputs["demand_std"]),
+                selling_price=float(inputs.get("selling_price") if inputs.get("selling_price") is not None else inputs["p"]),
+                unit_cost=float(inputs.get("unit_cost") if inputs.get("unit_cost") is not None else inputs["c"]),
+                salvage_value=float(inputs.get("salvage_value") if inputs.get("salvage_value") is not None else (inputs.get("v") or 0.0)),
+                goodwill_penalty=float(inputs.get("goodwill_penalty") if inputs.get("goodwill_penalty") is not None else (inputs.get("g") or 0.0)),
+                demand_mean=float(inputs.get("demand_mean") if inputs.get("demand_mean") is not None else inputs["mu"]),
+                demand_std=float(inputs.get("demand_std") if inputs.get("demand_std") is not None else inputs["sigma"]),
             )
             v_passed = res.verification.get("critical_ratio_valid_bounds", False) and res.verification.get("evpi_non_negative", False)
             return res, v_passed, res.verification

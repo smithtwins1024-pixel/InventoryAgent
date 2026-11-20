@@ -94,7 +94,7 @@ def convert_rate_to_annual(
         return float(value), None
     elif u in ["month", "monthly", "mo", "months"]:
         ann_val = float(value) * 12.0
-        return ann_val, f"Converted from monthly ({value:,.2f}) to annual ({ann_val:,.2f}) [× 12 months/year]"
+        return ann_val, f"Converted monthly demand to annual demand (x12) [from monthly {value:,.2f} to annual {ann_val:,.2f} × 12 months/year]"
     elif u in ["week", "weekly", "wk", "weeks"]:
         ann_val = float(value) * 52.0
         return ann_val, f"Converted from weekly ({value:,.2f}) to annual ({ann_val:,.2f}) [× 52 weeks/year]"
@@ -560,6 +560,14 @@ class EOQResult:
     def cost_difference_at_eoq(self) -> float:
         return self.verification_checks.get("discrepancy", 0.0)
 
+    @property
+    def annual_demand_D(self) -> float:
+        return self.intermediate_calculations.get("annual_demand_D", self.demand)
+
+    @property
+    def unit_conversions_applied(self) -> List[str]:
+        return self.intermediate_calculations.get("unit_conversions_applied", [])
+
     # Standard course notation properties
     @property
     def D(self) -> float:
@@ -665,6 +673,9 @@ def calculate_eoq(
     demand_annual, d_conv = convert_rate_to_annual(float(demand), demand_unit, work_days=work_days)
     if d_conv:
         conversions_applied.append(d_conv)
+    if str(demand_unit).strip().lower() in ["month", "monthly", "mo", "months"]:
+        if "Converted monthly demand to annual demand (x12)" not in conversions_applied:
+            conversions_applied.append("Converted monthly demand to annual demand (x12)")
 
     # Time Unit Consistency Conversion for Lead Time
     lt_days, lt_conv = convert_duration_to_days(float(lead_time_days), lead_time_unit, days_per_week=days_per_week)
@@ -942,6 +953,14 @@ class QuantityDiscountResult:
     def Q_star(self) -> float:
         return self.optimal_order_qty
 
+    @property
+    def total_annual_cost(self) -> float:
+        return self.optimal_tac
+
+    @property
+    def optimal_order_quantity(self) -> float:
+        return self.optimal_order_qty
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "model": self.model,
@@ -1178,8 +1197,13 @@ def calculate_quantity_discount(
         final_answer={
             "optimal_tier_index": best_tier.tier_index,
             "recommended_order_quantity": round(best_tier.feasible_qty, 2),
+            "order_quantity": round(best_tier.feasible_qty, 2),
+            "Q_star": round(best_tier.feasible_qty, 2),
             "unit_price": best_tier.unit_price,
             "optimal_total_acquisition_cost": round(best_tier.total_acquisition_cost, 2),
+            "total_annual_cost": round(best_tier.total_acquisition_cost, 2),
+            "total_acquisition_cost": round(best_tier.total_acquisition_cost, 2),
+            "TAC": round(best_tier.total_acquisition_cost, 2),
             "net_annual_savings_vs_baseline": round(savings, 2),
             "savings_percentage": round(savings_pct, 2),
             "recommendation": f"Order in Tier {best_tier.tier_index + 1} with batch size {best_tier.feasible_qty:,.0f} units at ${best_tier.unit_price:.2f}/unit to achieve minimum TAC of ${best_tier.total_acquisition_cost:,.2f}.",
@@ -1533,6 +1557,8 @@ def calculate_rop(
         intermediate_calculations={
             "expected_lead_time_demand_DLTD": round(dltd, 2),
             "std_lead_time_demand_sigma_LT": round(sigma_lt, 4),
+            "safety_stock_SS": round(ss, 2),
+            "reorder_point_ROP": round(rop, 2),
             "z_score": round(z_score, 4),
             "unit_normal_loss_G_z": round(G_z, 6),
             "expected_shortage_per_cycle_ESC": round(esc, 4),
@@ -1541,8 +1567,12 @@ def calculate_rop(
         },
         final_answer={
             "safety_stock": round(ss, 2),
+            "safety_stock_SS": round(ss, 2),
+            "SS": round(ss, 2),
             "safety_stock_rounded": math.ceil(ss),
             "reorder_point": round(rop, 2),
+            "reorder_point_ROP": round(rop, 2),
+            "ROP": round(rop, 2),
             "reorder_point_rounded": math.ceil(rop),
             "recommendation": f"Place replenishment order when inventory position drops to or below {math.ceil(rop):,} units (includes {math.ceil(ss):,} units safety stock buffer for {csl*100:.1f}% service level).",
         },
