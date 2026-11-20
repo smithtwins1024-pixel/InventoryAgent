@@ -134,7 +134,7 @@ def render_streamlit_app():
         )
 
         st.markdown("---")
-        if st.button("🧪 Run Automated Unit Tests (25 Tests)"):
+        if st.button("🧪 Run Automated Unit Tests (27 Tests)"):
             import tests.test_inventory_tools as test_mod
             suite = unittest.defaultTestLoader.loadTestsFromModule(test_mod)
             res = unittest.TextTestRunner(verbosity=0).run(suite)
@@ -281,31 +281,86 @@ def render_streamlit_app():
             st.json(decision.to_dict())
 
     # ========================================================================
-    # CSV DATA UPLOAD & ANALYSIS SECTION
-    # ========================================================================
-    # ========================================================================
-    # CSV DATA UPLOAD & ANALYSIS SECTION
+    # CSV DATA UPLOAD & INVENTORY ANALYSIS / CLASSIFICATION SECTION
     # ========================================================================
     if uploaded_file is not None:
         st.markdown("---")
-        st.header("📊 Uploaded CSV Data & Inventory Analysis")
 
         try:
-            # 1. Read CSV into a pandas dataframe
+            # 1. Read CSV into a pandas dataframe using existing uploader
             df = pd.read_csv(uploaded_file)
 
-            # 2. Validate required columns
-            required_columns = ["Product", "Category", "Units", "Unit Cost"]
-            missing_columns = [col for col in required_columns if col not in df.columns]
+            # Check if file has Multicriteria Classification columns (Sales & Hits)
+            has_sales = any("sales" in c.lower() for c in df.columns)
+            has_hits = any("hit" in c.lower() for c in df.columns)
+            is_classification = has_sales and has_hits
 
-            # 3. If required columns missing, display clear message identifying them
-            if missing_columns:
-                st.error(
-                    f"❌ **Missing Required Columns:** The uploaded CSV is missing: "
-                    f"**{', '.join(missing_columns)}**.\n\n"
-                    f"The file must contain all required columns: **{', '.join(required_columns)}**."
+            # Check if file has Basic Inventory Analysis columns (Product, Category, Units, Unit Cost)
+            required_basic = ["Product", "Category", "Units", "Unit Cost"]
+            is_basic = all(col in df.columns for col in required_basic)
+
+            if is_classification:
+                st.header("🏷️ Multicriteria Inventory Classification (Sales & Hits)")
+
+                import inventory_tools as it_mod
+                clf_res = it_mod.classify_inventory_multicriteria(df)
+                classified_df = clf_res.classified_df
+
+                # DATA PROCESSING (Dimensions of the uploaded dataframe)
+                st.subheader("📋 Dataset Overview")
+                dcol1, dcol2, dcol3 = st.columns([1, 1, 2])
+                dcol1.metric("Number of Rows (SKUs)", f"{len(df):,}")
+                dcol2.metric("Number of Columns", f"{len(df.columns):,}")
+                dcol3.markdown(f"**Column Names:** `{', '.join(list(df.columns))}`")
+
+                # Step 4: Display uploaded dataframe
+                st.subheader("📄 Uploaded Data")
+                st.dataframe(df, use_container_width=True, hide_index=True)
+
+                # Multicriteria Classification KPIs
+                st.subheader("📈 Stratification Summary (Sales & Hits)")
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("Total Items (SKUs)", f"{clf_res.total_items:,}")
+                k2.metric("Total Sales", f"${clf_res.total_sales:,.2f}")
+                k3.metric("Total Hits", f"{clf_res.total_hits:,.0f}")
+                k4.metric("Class A Items", f"{clf_res.class_distribution.get('A', 0):,}", f"{(clf_res.class_distribution.get('A', 0)/clf_res.total_items)*100:.1f}% of SKUs")
+
+                # Class Breakdown Metrics A, B, C, D
+                c1, c2, c3, c4 = st.columns(4)
+                for col, c_name in zip([c1, c2, c3, c4], ["A", "B", "C", "D"]):
+                    cnt = clf_res.class_distribution.get(c_name, 0)
+                    pct = (cnt / clf_res.total_items) * 100 if clf_res.total_items > 0 else 0
+                    col.metric(f"Class {c_name} Items", f"{cnt:,}", f"{pct:.1f}% of catalog")
+
+                # 4x4 Classification Matrix
+                st.subheader("🧩 Multicriteria Matrix (Sales Class × Hits Class)")
+                st.markdown("Distribution of items across **Sales (Velocity)** and **Hits (Transaction Frequency)**:")
+                st.dataframe(clf_res.matrix_distribution, use_container_width=True)
+
+                # Class Distribution Summary Table
+                st.subheader("📊 Class Distribution Summary")
+                st.dataframe(clf_res.class_summary_table, use_container_width=True, hide_index=True)
+
+                # Enriched Classified DataFrame
+                st.subheader("📄 Classified Inventory Items (with A, B, C, D Classes)")
+                st.dataframe(
+                    classified_df,
+                    use_container_width=True,
+                    column_config={
+                        "Sales ($)": st.column_config.NumberColumn("Sales ($)", format="$%.2f"),
+                        "Sales": st.column_config.NumberColumn("Sales", format="$%.2f"),
+                        "Hits": st.column_config.NumberColumn("Hits", format="%d"),
+                        "Sales Class": st.column_config.TextColumn("Sales Class"),
+                        "Hits Class": st.column_config.TextColumn("Hits Class"),
+                        "Multicriteria Class": st.column_config.TextColumn("Multicriteria Class"),
+                        "Class Code": st.column_config.TextColumn("Class Code (Sales+Hits)"),
+                    },
+                    hide_index=True,
                 )
-            else:
+
+            elif is_basic:
+                st.header("📊 Uploaded CSV Data & Inventory Analysis")
+
                 # Capture dimensions of the uploaded dataframe (4 columns: Product, Category, Units, Unit Cost)
                 num_rows = len(df)
                 num_cols = len(df.columns)
@@ -397,6 +452,15 @@ def render_streamlit_app():
                         "Inventory Value": st.column_config.NumberColumn("Inventory Value", format="$%.2f"),
                     },
                     hide_index=True,
+                )
+
+            else:
+                missing_cols = [col for col in required_basic if col not in df.columns]
+                st.error(
+                    f"❌ **Unrecognized CSV Format:**\n\n"
+                    f"The uploaded CSV does not match either supported inventory schema:\n\n"
+                    f"1. **Inventory Classification:** Requires `Item Number`, `Item Name`, `UoM`, `Sales ($)`, `Hits`\n"
+                    f"2. **Basic Inventory Analysis:** Missing `{', '.join(missing_cols)}` (Requires: `{', '.join(required_basic)}`)"
                 )
 
         except Exception as e:
