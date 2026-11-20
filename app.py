@@ -135,7 +135,10 @@ def render_streamlit_app():
 
         st.markdown("---")
         if st.button("🧪 Run Automated Unit Tests"):
-            import tests.test_inventory_tools as test_mod
+            try:
+                import tests.test_inventory_tools as test_mod
+            except ImportError:
+                import test_inventory_tools as test_mod
             suite = unittest.defaultTestLoader.loadTestsFromModule(test_mod)
             res = unittest.TextTestRunner(verbosity=0).run(suite)
             if res.wasSuccessful():
@@ -332,30 +335,91 @@ def render_streamlit_app():
                     pct = (cnt / clf_res.total_items) * 100 if clf_res.total_items > 0 else 0
                     col.metric(f"Class {c_name} Items", f"{cnt:,}", f"{pct:.1f}% of catalog")
 
-                # 4x4 Classification Matrix
-                st.subheader("🧩 Multicriteria Matrix (Sales Class × Hits Class)")
-                st.markdown("Distribution of items across **Sales (Velocity)** and **Hits (Transaction Frequency)**:")
-                st.dataframe(clf_res.matrix_distribution, use_container_width=True)
+                # Setup column configuration for classified dataframe display
+                col_config = {
+                    "Item Number": st.column_config.TextColumn("Item Number"),
+                    "Item Name": st.column_config.TextColumn("Item Name"),
+                    "UoM": st.column_config.TextColumn("UoM"),
+                    "Sales ($)": st.column_config.NumberColumn("Sales ($)", format="$%.2f"),
+                    "Sales": st.column_config.NumberColumn("Sales", format="$%.2f"),
+                    "Hits": st.column_config.NumberColumn("Hits", format="%d"),
+                    "Cumulative Sales %": st.column_config.NumberColumn("Cumulative Sales %", format="%.2f%%"),
+                    "Sales Class": st.column_config.TextColumn("Sales Class"),
+                    "Hits Class": st.column_config.TextColumn("Hits Class"),
+                    "Combined Weighted Score": st.column_config.NumberColumn("Combined Weighted Score", format="%.2f"),
+                    "Final Inventory Class": st.column_config.TextColumn("Final Inventory Class"),
+                }
 
-                # Class Distribution Summary Table
-                st.subheader("📊 Class Distribution Summary")
-                st.dataframe(clf_res.class_summary_table, use_container_width=True, hide_index=True)
-
-                # Enriched Classified DataFrame
-                st.subheader("📄 Classified Inventory Items (with A, B, C, D Classes)")
+                # 1. Main DataFrame Display (Preserving original Sales ($) descending order)
+                st.subheader("📄 Classified Inventory Items (Sales Descending Order Preserved)")
+                st.markdown(
+                    "Main dataframe sorted by **Sales ($) descending** (mergesort preserved), with appended "
+                    "**Sales Class**, **Hits Class**, **Combined Weighted Score**, and **Final Inventory Class**:"
+                )
                 st.dataframe(
                     classified_df,
                     use_container_width=True,
+                    column_config=col_config,
+                    hide_index=True,
+                )
+
+                # 2. Portfolio Summary Table (Grouped by Final Inventory Class A, B, C, D)
+                st.subheader("📊 Portfolio Summary Table (Grouped by Final Inventory Class)")
+                st.markdown(
+                    "Portfolio summary grouped by **Final Inventory Class (A, B, C, D)** showing the exact "
+                    "**Item Count** and **Total Sales ($)** per class, plus totals:"
+                )
+                st.dataframe(
+                    clf_res.portfolio_summary_table,
+                    use_container_width=True,
                     column_config={
-                        "Sales ($)": st.column_config.NumberColumn("Sales ($)", format="$%.2f"),
-                        "Sales": st.column_config.NumberColumn("Sales", format="$%.2f"),
-                        "Hits": st.column_config.NumberColumn("Hits", format="%d"),
-                        "Sales Class": st.column_config.TextColumn("Sales Class"),
-                        "Hits Class": st.column_config.TextColumn("Hits Class"),
-                        "Multicriteria Class": st.column_config.TextColumn("Multicriteria Class"),
-                        "Class Code": st.column_config.TextColumn("Class Code (Sales+Hits)"),
+                        "Final Inventory Class": st.column_config.TextColumn("Final Inventory Class"),
+                        "Item Count": st.column_config.NumberColumn("Item Count", format="%d"),
+                        "Total Sales ($)": st.column_config.NumberColumn("Total Sales ($)", format="$%.2f"),
+                        "% of Items": st.column_config.NumberColumn("% of Items", format="%.2f%%"),
+                        "% of Total Sales": st.column_config.NumberColumn("% of Total Sales", format="%.2f%%"),
                     },
                     hide_index=True,
+                )
+
+                # 3. Top 5 Items by Sales ($) for each Final Inventory Class (A, B, C, and D)
+                st.subheader("🏆 Top 5 Items by Sales ($) for Each Final Inventory Class")
+                st.markdown(
+                    "Top 5 revenue-generating items within each **Final Inventory Class (A, B, C, D)**:"
+                )
+                tab_a, tab_b, tab_c, tab_d = st.tabs([
+                    "⭐ Class A (Top 5)",
+                    "⭐ Class B (Top 5)",
+                    "⭐ Class C (Top 5)",
+                    "⭐ Class D (Top 5)",
+                ])
+
+                for tab_obj, c_name in zip([tab_a, tab_b, tab_c, tab_d], ["A", "B", "C", "D"]):
+                    with tab_obj:
+                        top_df = clf_res.top_5_items_by_class.get(c_name)
+                        if top_df is not None and not top_df.empty:
+                            st.markdown(f"**Top {len(top_df)} items in Final Inventory Class {c_name} (by Sales):**")
+                            st.dataframe(
+                                top_df,
+                                use_container_width=True,
+                                column_config=col_config,
+                                hide_index=True,
+                            )
+                        else:
+                            st.info(f"No items categorized under Final Inventory Class {c_name}.")
+
+                # 4. Multicriteria Matrix
+                st.subheader("🧩 Multicriteria Matrix (Sales Class × Hits Class)")
+                st.markdown("Distribution of items across **Sales Class (Velocity)** and **Hits Class (Transaction Frequency)**:")
+                st.dataframe(clf_res.matrix_distribution, use_container_width=True)
+
+                # 5. Download Enriched CSV
+                csv_bytes = classified_df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    label="📥 Download Multicriteria Classified Inventory CSV",
+                    data=csv_bytes,
+                    file_name="multicriteria_classified_inventory.csv",
+                    mime="text/csv",
                 )
 
             elif is_basic:
@@ -669,7 +733,10 @@ else:
         agent = InventoryDecisionAgent()
 
         if args.test:
-            import tests.test_inventory_tools as test_mod
+            try:
+                import tests.test_inventory_tools as test_mod
+            except ImportError:
+                import test_inventory_tools as test_mod
             suite = unittest.defaultTestLoader.loadTestsFromModule(test_mod)
             runner = unittest.TextTestRunner(verbosity=2)
             res = runner.run(suite)
