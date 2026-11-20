@@ -134,7 +134,7 @@ def render_streamlit_app():
         )
 
         st.markdown("---")
-        if st.button("🧪 Run Automated Unit Tests (27 Tests)"):
+        if st.button("🧪 Run Automated Unit Tests"):
             import tests.test_inventory_tools as test_mod
             suite = unittest.defaultTestLoader.loadTestsFromModule(test_mod)
             res = unittest.TextTestRunner(verbosity=0).run(suite)
