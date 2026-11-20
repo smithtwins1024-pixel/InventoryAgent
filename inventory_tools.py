@@ -961,6 +961,18 @@ class QuantityDiscountResult:
     def optimal_order_quantity(self) -> float:
         return self.optimal_order_qty
 
+    @property
+    def selected_tier(self) -> int:
+        return self.optimal_tier_index
+
+    @property
+    def best_tier(self) -> int:
+        return self.optimal_tier_index
+
+    @property
+    def discount_schedule_tier_count(self) -> int:
+        return len(self.tiers) or self.inputs_extracted.get("discount_schedule_tier_count", 0)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "model": self.model,
@@ -1315,6 +1327,22 @@ class ROPResult:
 
     @property
     def ROP(self) -> float:
+        return self.reorder_point
+
+    @property
+    def L(self) -> float:
+        return self.lead_time_days_mean
+
+    @property
+    def sigma_L(self) -> float:
+        return self.lead_time_days_std
+
+    @property
+    def safety_stock_SS(self) -> float:
+        return self.safety_stock
+
+    @property
+    def reorder_point_ROP(self) -> float:
         return self.reorder_point
 
     def to_dict(self) -> Dict[str, Any]:

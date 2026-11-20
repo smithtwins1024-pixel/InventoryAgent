@@ -1032,14 +1032,34 @@ class TestAgentUnitConsistencyEndToEnd(unittest.TestCase):
         self.assertAlmostEqual(decision.raw_result.reorder_point_ROP, 1078.04, places=2)
 
     def test_quantity_discount_model_routing_and_calculation_test_8(self):
-        query = "The supplier charges $12 per unit for orders below 500, $11.50 for 500-999, and $11 for 1,000 or more. Annual demand is 5,000 units, ordering cost is $60, and annual holding cost rate is 20% of unit cost."
+        query = "The supplier charges $12 per unit for orders below 500 units, $11.50 for 500-999 units, and $11 for orders of 1,000 units or more. Annual demand is 5,000 units, ordering cost is $60, and annual holding cost rate is 20% of unit cost."
         decision = self.agent.solve(query)
         self.assertEqual(decision.model_identified, self.agent.MODEL_QUANTITY_DISCOUNT)
         self.assertNotEqual(decision.model_identified, self.agent.MODEL_EOQ)
         self.assertTrue(decision.verification_passed)
+        self.assertEqual(decision.extracted_inputs.get("discount_schedule_tier_count"), 3)
+        self.assertEqual(decision.raw_result.discount_schedule_tier_count, 3)
+        self.assertEqual(decision.extracted_inputs.get("discount_schedule"), [(1, 499, 12.0), (500, 999, 11.5), (1000, None, 11.0)])
+        self.assertEqual(decision.raw_result.best_tier, 2)
         self.assertAlmostEqual(decision.raw_result.optimal_order_quantity, 1000.00, places=2)
         self.assertAlmostEqual(decision.raw_result.total_annual_cost, 56400.00, places=2)
-        self.assertEqual(decision.raw_result.best_tier, 2)
+        self.assertAlmostEqual(decision.raw_result.optimal_unit_price, 11.00, places=2)
+
+    def test_quantity_discount_open_ended_top_tier_phrasing_variations(self):
+        variations = [
+            "The supplier charges $12 per unit for orders below 500 units, $11.50 for 500-999 units, and $11 for 1,000+ units. Annual demand is 5,000 units, ordering cost is $60, and annual holding cost rate is 20% of unit cost.",
+            "The supplier charges $12 per unit for orders below 500 units, $11.50 for 500-999 units, and $11 for orders >= 1,000. Annual demand is 5,000 units, ordering cost is $60, and annual holding cost rate is 20% of unit cost.",
+            "The supplier charges $12 per unit for orders below 500 units, $11.50 for 500-999 units, and $11 for at least 1,000 units. Annual demand is 5,000 units, ordering cost is $60, and annual holding cost rate is 20% of unit cost.",
+            "The supplier charges $12 per unit for orders below 500, $11.50 for 500-999, and $11 for 1,000 or more. Annual demand is 5,000 units, ordering cost is $60, and annual holding cost rate is 20% of unit cost.",
+        ]
+        for query in variations:
+            decision = self.agent.solve(query)
+            self.assertEqual(decision.model_identified, self.agent.MODEL_QUANTITY_DISCOUNT)
+            self.assertEqual(decision.extracted_inputs.get("discount_schedule_tier_count"), 3)
+            self.assertEqual(decision.raw_result.discount_schedule_tier_count, 3)
+            self.assertEqual(decision.raw_result.best_tier, 2)
+            self.assertAlmostEqual(decision.raw_result.optimal_order_quantity, 1000.00, places=2)
+            self.assertAlmostEqual(decision.raw_result.total_annual_cost, 56400.00, places=2)
 
 
 if __name__ == "__main__":

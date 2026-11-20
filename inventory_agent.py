@@ -181,10 +181,10 @@ class InventoryInputExtractor:
             if not any(t[0] == lo and t[1] == hi for t in tiers):
                 tiers.append((lo, hi, p))
 
-        # 5. Price before 'min or more'
-        # e.g., '$11 for 1000 or more' or '$11 for orders of 1000 or more'
+        # 5. Price before open-ended tier:
+        # 5a. '$11 for orders of 1,000 units or more', '$11 for 1000 units and above', '$11 for 1000 or more'
         for m in re.finditer(
-            r'\$?([0-9]+(?:\.[0-9]+)?)\s*(?:per\s*unit|each)?\s*for\s*(?:orders?\s+(?:of\s+)?)?([0-9]+)\s*(?:or\s+more|and\s+above|and\s+over|\+|or\s+over)',
+            r'\$?([0-9]+(?:\.[0-9]+)?)\s*(?:per\s*unit|each)?\s*for\s*(?:orders?\s+(?:of\s+)?)?([0-9]+)\s*(?:units?|items?|pieces?)?\s*(?:or\s+more|and\s+above|and\s+over|\+|or\s+over)',
             text,
             re.IGNORECASE,
         ):
@@ -193,9 +193,32 @@ class InventoryInputExtractor:
             if not any(t[0] == lo and t[1] is None for t in tiers):
                 tiers.append((lo, None, p))
 
-        # 6. 'min or more at $price' or '1000+: $11' or '>= 1000: $11'
+        # 5b. '$11 for 1,000+ units' or '$11 for orders of 1,000+ units'
         for m in re.finditer(
-            r'(?:>=|>)\s*([0-9]+)\s*(?:units?)?\s*(?:at|@|:|\$)\s*\$?([0-9]+(?:\.[0-9]+)?)',
+            r'\$?([0-9]+(?:\.[0-9]+)?)\s*(?:per\s*unit|each)?\s*for\s*(?:orders?\s+(?:of\s+)?)?([0-9]+)\s*\+\s*(?:units?|items?|pieces?)?',
+            text,
+            re.IGNORECASE,
+        ):
+            p = float(m.group(1))
+            lo = int(m.group(2))
+            if not any(t[0] == lo and t[1] is None for t in tiers):
+                tiers.append((lo, None, p))
+
+        # 5c. '$11 for orders >= 1,000' or '$11 for at least 1,000 units' or '$11 for minimum 1,000 units'
+        for m in re.finditer(
+            r'\$?([0-9]+(?:\.[0-9]+)?)\s*(?:per\s*unit|each)?\s*for\s*(?:orders?\s+(?:of\s+)?)?(?:>=|>|at\s+least|minimum\s+of|minimum|min\.?\s+of|min\.?)\s*([0-9]+)\s*(?:units?|items?|pieces?)?',
+            text,
+            re.IGNORECASE,
+        ):
+            p = float(m.group(1))
+            lo = int(m.group(2))
+            if not any(t[0] == lo and t[1] is None for t in tiers):
+                tiers.append((lo, None, p))
+
+        # 6. Open-ended tier before price:
+        # 6a. '>= 1000 units at $11' or 'at least 1000 units at $11' or 'orders >= 1000: $11'
+        for m in re.finditer(
+            r'(?:orders?\s+(?:of\s+)?)?(?:>=|>|at\s+least|minimum\s+of|minimum|min\.?\s+of|min\.?)\s*([0-9]+)\s*(?:units?|items?|pieces?)?\s*(?:at|@|:|\$|\s+for|\s+costs?|\s+charges?)\s*(?:cost\s+)?\$?([0-9]+(?:\.[0-9]+)?)',
             text,
             re.IGNORECASE,
         ):
@@ -204,8 +227,9 @@ class InventoryInputExtractor:
             if not any(t[0] == lo and t[1] is None for t in tiers):
                 tiers.append((lo, None, p))
 
+        # 6b. '1000+ units at $11' or '1000 or more units at $11' or '1000 units or more: $11'
         for m in re.finditer(
-            r'([0-9]+)\s*(?:\+|and above|or more|and over|\s*plus)\s*(?:units?)?\s*(?:at|@|:|\$)\s*\$?([0-9]+(?:\.[0-9]+)?)',
+            r'(?:orders?\s+(?:of\s+)?)?([0-9]+)\s*(?:units?|items?|pieces?)?\s*(?:\+|and\s+above|or\s+more|and\s+over|\s*plus)\s*(?:units?|items?|pieces?)?\s*(?:at|@|:|\$|\s+for|\s+costs?|\s+charges?)\s*(?:cost\s+)?\$?([0-9]+(?:\.[0-9]+)?)',
             text,
             re.IGNORECASE,
         ):
@@ -592,6 +616,7 @@ class InventoryInputExtractor:
         tiers = cls.extract_discount_schedule(text)
         if tiers:
             inputs["discount_schedule"] = tiers
+            inputs["discount_schedule_tier_count"] = len(tiers)
 
         return inputs
 
