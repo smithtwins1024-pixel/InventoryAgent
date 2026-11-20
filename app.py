@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import http.server
+import importlib
 import io
 import json
 from pathlib import Path
@@ -29,7 +30,22 @@ import unittest
 import urllib.parse
 from typing import Any, Dict
 
+# Ensure the app's directory is always first in sys.path
+_app_dir = str(Path(__file__).parent.resolve())
+if _app_dir not in sys.path:
+    sys.path.insert(0, _app_dir)
+
 import pandas as pd
+
+# Hot-reload check to ensure clean restarts in Streamlit
+import inventory_tools as it_mod
+if not hasattr(it_mod, "classify_inventory_multicriteria"):
+    it_mod = importlib.reload(it_mod)
+
+from inventory_tools import (
+    ClassificationResult,
+    classify_inventory_multicriteria,
+)
 
 from inventory_agent import InventoryDecisionAgent
 
@@ -305,8 +321,16 @@ def render_streamlit_app():
             if is_classification:
                 st.header("🏷️ Multicriteria Inventory Classification (Sales & Hits)")
 
-                import inventory_tools as it_mod
-                clf_res = it_mod.classify_inventory_multicriteria(df)
+                # Robust hot-reload fallback to guarantee clean restart in Streamlit
+                try:
+                    import inventory_tools as it_mod
+                    if not hasattr(it_mod, "classify_inventory_multicriteria"):
+                        it_mod = importlib.reload(it_mod)
+                    classify_fn = getattr(it_mod, "classify_inventory_multicriteria", classify_inventory_multicriteria)
+                except Exception:
+                    classify_fn = classify_inventory_multicriteria
+
+                clf_res = classify_fn(df)
                 classified_df = clf_res.classified_df
 
                 # DATA PROCESSING (Dimensions of the uploaded dataframe)
